@@ -1,0 +1,521 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  Cloud Security Incident Response Monitoring Stack
+  with automated SNS alerting and remediation.
+
+Resources:
+
+  # 1. Intentionally weakened test S3 bucket
+  TestS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      Tags:
+        - Key: Purpose
+          Value: SecurityIncidentTesting
+        - Key: Environment
+          Value: Test
+
+  # 2. Dedicated VPC for security group testing
+  TestVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: CloudIncidentTestVPC
+
+  # 3. Dedicated security group for remediation
+  TestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group used for incident response testing
+      VpcId: !Ref TestVPC
+      Tags:
+        - Key: Name
+          Value: CloudIncidentTestSecurityGroup
+
+  # 4. CloudTrail log storage bucket
+  CloudTrailLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  # 5. Allow CloudTrail to write logs
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailLogBucket.Arn
+
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailLogBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  # 6. CloudTrail monitoring
+  SecurityTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: CloudSecurityIncidentTrail
+      S3BucketName: !Ref CloudTrailLogBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+
+  # 7. SNS alert topic
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: cloud-security-alerts
+
+  # 8. Alert Lambda execution role
+  AlertLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AlertLambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertTopic
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # 9. Alert handler Lambda
+  AlertHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CloudSecurityAlertHandler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AlertLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertTopic
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          SUSPICIOUS_EVENTS = {
+              "PutBucketPolicy",
+              "PutBucketAcl",
+              "DeletePublicAccessBlock",
+              "AuthorizeSecurityGroupIngress",
+              "ModifySecurityGroupRules",
+          }
+
+          def lambda_handler(event, context):
+              detail = event.get("detail", {})
+              event_name = detail.get("eventName", "Unknown")
+              username = detail.get(
+                  "userIdentity", {}
+              ).get("userName", "Unknown")
+
+              if event_name not in SUSPICIOUS_EVENTS:
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps(
+                          "No suspicious activity detected."
+                      )
+                  }
+
+              message = {
+                  "alert": "Suspicious AWS API activity detected",
+                  "event_name": event_name,
+                  "username": username,
+                  "region": detail.get("awsRegion", "Unknown"),
+                  "source_ip": detail.get(
+                      "sourceIPAddress", "Unknown"
+                  ),
+                  "event_time": detail.get("eventTime", "Unknown")
+              }
+
+              topic_arn = os.environ.get("SNS_TOPIC_ARN")
+
+              if not topic_arn:
+                  raise ValueError(
+                      "SNS_TOPIC_ARN environment variable is missing"
+                  )
+
+              sns = boto3.client("sns")
+
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject="Cloud Security Alert",
+                  Message=json.dumps(message, indent=4)
+              )
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps(
+                      "Security alert published successfully."
+                  )
+              }
+
+  # 10. EventBridge rule for suspicious API activity
+  SecurityEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: CloudSecuritySuspiciousAPIRule
+      Description: Detect suspicious S3 and EC2 API activity
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+            - ec2.amazonaws.com
+          eventName:
+            - PutBucketPolicy
+            - PutBucketAcl
+            - DeletePublicAccessBlock
+            - AuthorizeSecurityGroupIngress
+            - ModifySecurityGroupRules
+      Targets:
+        - Id: AlertLambdaTarget
+          Arn: !GetAtt AlertHandlerLambda.Arn
+
+  # 11. Allow EventBridge to invoke alert Lambda
+  AllowEventBridgeInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertHandlerLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityEventRule.Arn
+
+  # 12. S3 remediation Lambda role
+  S3RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3RemediationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketPublicAccessBlock
+                Resource: !GetAtt TestS3Bucket.Arn
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # 13. S3 remediation Lambda
+  S3RemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3PublicAccessRemediation
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt S3RemediationRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              bucket = (
+                  event.get("bucket")
+                  or event.get("bucketName")
+              )
+
+              if not bucket:
+                  return {
+                      "statusCode": 400,
+                      "message": "Bucket name is required."
+                  }
+
+              s3 = boto3.client("s3")
+
+              s3.put_public_access_block(
+                  Bucket=bucket,
+                  PublicAccessBlockConfiguration={
+                      "BlockPublicAcls": True,
+                      "IgnorePublicAcls": True,
+                      "BlockPublicPolicy": True,
+                      "RestrictPublicBuckets": True
+                  }
+              )
+
+              return {
+                  "statusCode": 200,
+                  "message": (
+                      f"Public access blocked for bucket {bucket}."
+                  )
+              }
+
+  # 14. Security group remediation Lambda role
+  SecurityGroupRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecurityGroupRemediationPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+
+              - Effect: Allow
+                Action:
+                  - ec2:RevokeSecurityGroupIngress
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:security-group/${TestSecurityGroup}'
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # 15. Security group remediation Lambda
+  SecurityGroupRemediationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SecurityGroupRemediation
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityGroupRemediationRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+
+          def lambda_handler(event, context):
+              security_group = (
+                  event.get("security_group")
+                  or event.get("groupId")
+              )
+
+              if not security_group:
+                  return {
+                      "statusCode": 400,
+                      "message": "Security group is required."
+                  }
+
+              ec2 = boto3.client("ec2")
+
+              response = ec2.describe_security_groups(
+                  GroupIds=[security_group]
+              )
+
+              for group in response["SecurityGroups"]:
+                  for permission in group.get("IpPermissions", []):
+
+                      public_ipv4 = [
+                          item for item in permission.get(
+                              "IpRanges", []
+                          )
+                          if item.get("CidrIp") == "0.0.0.0/0"
+                      ]
+
+                      public_ipv6 = [
+                          item for item in permission.get(
+                              "Ipv6Ranges", []
+                          )
+                          if item.get("CidrIpv6") == "::/0"
+                      ]
+
+                      if public_ipv4 or public_ipv6:
+                          revoke_permission = {
+                              "IpProtocol": permission["IpProtocol"]
+                          }
+
+                          for key in ("FromPort", "ToPort"):
+                              if key in permission:
+                                  revoke_permission[key] = (
+                                      permission[key]
+                                  )
+
+                          if public_ipv4:
+                              revoke_permission["IpRanges"] = public_ipv4
+
+                          if public_ipv6:
+                              revoke_permission["Ipv6Ranges"] = public_ipv6
+
+                          ec2.revoke_security_group_ingress(
+                              GroupId=security_group,
+                              IpPermissions=[revoke_permission]
+                          )
+
+              return {
+                  "statusCode": 200,
+                  "message": (
+                      f"Public ingress access restricted for "
+                      f"{security_group}."
+                  )
+              }
+
+  # 16. Detect S3 security changes
+  S3RemediationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: S3PublicAccessRemediationRule
+      Description: Detect S3 policy and ACL changes
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutBucketPolicy
+            - PutBucketAcl
+            - DeletePublicAccessBlock
+          requestParameters:
+            bucketName:
+              - !Ref TestS3Bucket
+      Targets:
+        - Id: S3RemediationTarget
+          Arn: !GetAtt S3RemediationLambda.Arn
+          InputTransformer:
+            InputPathsMap:
+              bucketName: $.detail.requestParameters.bucketName
+            InputTemplate: '{"bucketName": <bucketName>}'
+
+  # 17. Allow EventBridge to invoke S3 remediation
+  AllowS3RemediationInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3RemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3RemediationEventRule.Arn
+
+  # 18. Detect security group changes for the test group only
+  SecurityGroupRemediationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SecurityGroupRemediationRule
+      Description: Detect ingress changes to the dedicated test security group
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - ModifySecurityGroupRules
+          requestParameters:
+            groupId:
+              - !Ref TestSecurityGroup
+      Targets:
+        - Id: SecurityGroupRemediationTarget
+          Arn: !GetAtt SecurityGroupRemediationLambda.Arn
+          InputTransformer:
+            InputPathsMap:
+              groupId: $.detail.requestParameters.groupId
+            InputTemplate: '{"groupId": <groupId>}'
+
+  # 19. Allow EventBridge to invoke security group remediation
+  AllowSecurityGroupRemediationInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecurityGroupRemediationLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupRemediationEventRule.Arn
+
+Outputs:
+
+  TestBucketName:
+    Description: Name of the monitored test bucket
+    Value: !Ref TestS3Bucket
+
+  TestVPCId:
+    Description: Dedicated test VPC ID
+    Value: !Ref TestVPC
+
+  TestSecurityGroupId:
+    Description: Dedicated security group ID for remediation testing
+    Value: !Ref TestSecurityGroup
+
+  AlertTopicArn:
+    Description: ARN of the SNS security alert topic
+    Value: !Ref SecurityAlertTopic
+
+  AlertLambdaName:
+    Description: Alert handler Lambda function
+    Value: !Ref AlertHandlerLambda
+
+  CloudTrailName:
+    Description: CloudTrail monitoring trail
+    Value: !Ref SecurityTrail
